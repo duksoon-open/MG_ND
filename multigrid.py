@@ -1,7 +1,7 @@
-from typing import List
+from typing import Any, List
 
 import numpy as np
-from scipy.sparse.linalg import spsolve
+from scipy.sparse.linalg import spsolve, splu
 
 from mesh import UniformMesh
 from ndassemble_cube3d import NDAssembleCube3D
@@ -11,6 +11,9 @@ from ndintergrid_cube3d import NDIntergridCube3D
 class MG:
     smoother_index_vertex: List[List[dict]]
     smoother_index_edge: List[List[dict]]
+    a_ii_solver: List[Any]
+    s_gg_solver_f: List[Any]
+    s_gg_solver_e: List[Any]
 
     def __init__(self, level, cycle, num_presmoothing, num_postsmoothing, smoothing_method, damping_factor, alpha=1.0,
                  beta=1.0, mesh_name='cube'):
@@ -21,6 +24,7 @@ class MG:
 
         self.mesh = [UniformMesh(2 ** (i + 1), mesh_name) for i in np.arange(self.level + 1)]
         self.nd = [NDAssembleCube3D(self.mesh[i], self.alpha, self.beta) for i in np.arange(self.level + 1)]
+        self.h = [mesh.get_h() for mesh in self.mesh]
 
         self.boundary = [self.mesh[i].get_boundary_edge() for i in np.arange(self.level + 1)]
         self.interior = [np.setdiff1d(np.arange(self.mesh[i].get_edge_size()), self.boundary[i]) for i in
@@ -57,10 +61,15 @@ class MG:
 
         self.smoother_index_edge = [[] for _ in np.arange(self.level + 1)]
         self.smoother_index_vertex = [[] for _ in np.arange(self.level + 1)]
-        self.smoother_index_vertex_os = [[] for _ in np.arange(self.level + 1)]
         self.smoother_index_sc = [dict() for _ in np.arange(self.level + 1)]
+        self.smoother_index_face_gamma_ov = [[] for _ in np.arange(self.level + 1)]
+        self.smoother_index_edge_gamma_ov = [[] for _ in np.arange(self.level + 1)]
         self.matrices = [dict() for _ in np.arange(self.level + 1)]
         self.stiff_sub = [[] for _ in np.arange(self.level + 1)]
+        self.sc_solver = [[] for _ in np.arange(self.level + 1)]
+        self.a_ii_solver = [[] for _ in np.arange(self.level + 1)]
+        self.s_gg_solver_f = [[] for _ in np.arange(self.level + 1)]
+        self.s_gg_solver_e = [[] for _ in np.arange(self.level + 1)]
 
         for i in np.arange(self.level):
             self.smoother_setting(i + 1)
@@ -77,48 +86,8 @@ class MG:
         self.smoother_setting_vertex(k)
         self.smoother_setting_sc(k)
         self.smoother_setting_interior(k)
-
-    def smoother_setting_interior(self, k):
-        coarse_element_interior_edge = self.substructure[k - 1].get_coarse_element_interior_edge()
-        stiff_sub = []
-        for interior_index in coarse_element_interior_edge:
-            stiff_sub.append(
-                self.stiffness_matrix[k].tocsr()[interior_index, :].tocsc()[:, interior_index].tocsr().toarray())
-        self.stiff_sub[k] = stiff_sub
-
-    def smoother_setting_sc(self, k):
-        index = dict(
-            {'interior': np.array([], dtype=int), 'face': np.array([], dtype=int), 'edge': np.array([], dtype=int)})
-        matrices = dict()
-        coarse_element_interior_edge = self.substructure[k - 1].get_coarse_element_interior_edge()
-        for element_index in coarse_element_interior_edge:
-            index['interior'] = np.append(index['interior'], element_index)
-        coarse_face_interior_edge = self.substructure[k - 1].get_coarse_face_interior_edge()
-        coarse_face_size = self.mesh[k - 1].get_face_size()
-        coarse_boundary_face = self.mesh[k - 1].get_boundary_face()
-        coarse_interior_face = np.setdiff1d(np.arange(coarse_face_size), coarse_boundary_face)
-        for i in coarse_interior_face:
-            index['face'] = np.append(index['face'], coarse_face_interior_edge[i])
-        coarse_interior_edge = self.interior[k - 1]
-        coarse_to_fine_edge = self.substructure[k - 1].get_coarse_to_fine_edge()
-        for i in coarse_interior_edge:
-            index['edge'] = np.append(index['edge'], coarse_to_fine_edge[i])
-
-        interior_index = index['interior']
-        face_index = index['face']
-        edge_index = index['edge']
-        gamma_index = np.append(face_index, edge_index)
-
-        a_ii = self.stiffness_matrix[k].tocsr()[interior_index, :].tocsc()[:, interior_index].tocsr()
-        a_ig = self.stiffness_matrix[k].tocsr()[interior_index, :].tocsc()[:, gamma_index].tocsr()
-        a_gi = self.stiffness_matrix[k].tocsr()[gamma_index, :].tocsc()[:, interior_index].tocsr()
-
-        matrices['a_ii'] = a_ii
-        matrices['a_ig'] = a_ig
-        matrices['a_gi'] = a_gi
-
-        self.matrices[k] = matrices
-        self.smoother_index_sc[k] = index
+        if self.smoothing_method == 'face_edge_ov':
+            self.smoother_setting_edge_ov(k)
 
     def smoother_setting_edge(self, k):
         coarse_face_size = self.mesh[k - 1].get_face_size()
@@ -196,11 +165,119 @@ class MG:
             index_sub.append(index_sub_i)
         self.smoother_index_vertex[k] = index_sub
 
+    def smoother_setting_sc(self, k):
+        index = dict(
+            {'interior': np.array([], dtype=int), 'face': np.array([], dtype=int), 'edge': np.array([], dtype=int)})
+        matrices = dict()
+        coarse_element_interior_edge = self.substructure[k - 1].get_coarse_element_interior_edge()
+        for element_index in coarse_element_interior_edge:
+            index['interior'] = np.append(index['interior'], element_index)
+        coarse_face_interior_edge = self.substructure[k - 1].get_coarse_face_interior_edge()
+        coarse_face_size = self.mesh[k - 1].get_face_size()
+        coarse_boundary_face = self.mesh[k - 1].get_boundary_face()
+        coarse_interior_face = np.setdiff1d(np.arange(coarse_face_size), coarse_boundary_face)
+        for i in coarse_interior_face:
+            index['face'] = np.append(index['face'], coarse_face_interior_edge[i])
+        coarse_interior_edge = self.interior[k - 1]
+        coarse_to_fine_edge = self.substructure[k - 1].get_coarse_to_fine_edge()
+        for i in coarse_interior_edge:
+            index['edge'] = np.append(index['edge'], coarse_to_fine_edge[i])
+
+        interior_index = index['interior']
+        face_index = index['face']
+        edge_index = index['edge']
+        gamma_index = np.append(face_index, edge_index)
+
+        a_ii = self.stiffness_matrix[k].tocsr()[interior_index, :].tocsc()[:, interior_index].tocsr()
+        a_ig = self.stiffness_matrix[k].tocsr()[interior_index, :].tocsc()[:, gamma_index].tocsr()
+        a_gi = self.stiffness_matrix[k].tocsr()[gamma_index, :].tocsc()[:, interior_index].tocsr()
+        a_gg = self.stiffness_matrix[k].tocsr()[gamma_index, :].tocsc()[:, gamma_index].tocsr()
+
+        matrices['a_ii'] = a_ii
+        matrices['a_ig'] = a_ig
+        matrices['a_gi'] = a_gi
+        matrices['a_gg'] = a_gg
+
+        self.a_ii_solver[k] = splu(a_ii.tocsc())
+
+        s_gg = a_gg - np.dot(a_gi, spsolve(a_ii.tocsc(), a_ig.tocsc()))
+        matrices['s_gg'] = s_gg
+
+        self.matrices[k] = matrices
+        self.smoother_index_sc[k] = index
+
+        if self.smoothing_method == 'edge_gamma_is':
+            coarse_interior_edge_size = len(self.interior[k - 1])
+
+            for i in np.arange(coarse_interior_edge_size):
+                face_index_sub_g = self.smoother_index_edge[k][i]['face']
+                edge_index_sub_g = self.smoother_index_edge[k][i]['edge']
+                interior_index_sub_g = self.smoother_index_edge[k][i]['interior']
+                gamma_index_sub_g = np.append(face_index_sub_g, edge_index_sub_g)
+                index = np.append(interior_index_sub_g, gamma_index_sub_g)
+                stiff_sub = self.stiffness_matrix[k].tocsr()[index, :].tocsc()[:, index].tocsr()
+                self.sc_solver[k].append(splu(stiff_sub.tocsc()))
+
+        if self.smoothing_method == 'vertex_gamma_is':
+            coarse_vertex_size = self.mesh[k - 1].get_vertex_size()
+            coarse_boundary_vertex_size = len(self.mesh[k - 1].get_boundary_vertex())
+            coarse_interior_vertex_size = coarse_vertex_size - coarse_boundary_vertex_size
+
+            for i in np.arange(coarse_interior_vertex_size):
+                face_index_sub_g = self.smoother_index_vertex[k][i]['face']
+                edge_index_sub_g = self.smoother_index_vertex[k][i]['edge']
+                interior_index_sub_g = self.smoother_index_vertex[k][i]['interior']
+                gamma_index_sub_g = np.append(face_index_sub_g, edge_index_sub_g)
+                index = np.append(interior_index_sub_g, gamma_index_sub_g)
+                stiff_sub = self.stiffness_matrix[k].tocsr()[index, :].tocsc()[:, index].tocsr()
+                self.sc_solver[k].append(splu(stiff_sub.tocsc()))
+
+    def smoother_setting_interior(self, k):
+        coarse_element_interior_edge = self.substructure[k - 1].get_coarse_element_interior_edge()
+        stiff_sub = []
+        for interior_index in coarse_element_interior_edge:
+            stiff_sub.append(
+                self.stiffness_matrix[k].tocsr()[interior_index, :].tocsc()[:, interior_index].tocsr().toarray())
+        self.stiff_sub[k] = stiff_sub
+
+    def smoother_setting_edge_ov(self, k):
+        coarse_interior_edge = self.interior[k - 1]
+        coarse_edge_interior_vertex = self.substructure[k - 1].get_coarse_edge_interior_vertex()
+        neighboring_fine_edge = self.mesh[k].get_vertex()['edge']
+
+        face_index = self.smoother_index_sc[k]['face']
+        edge_index = self.smoother_index_sc[k]['edge']
+        gamma_index = np.append(face_index, edge_index)
+
+        local_gamma_face_index = np.arange(len(face_index))
+        self.smoother_index_face_gamma_ov[k] = local_gamma_face_index
+
+        s_gg = self.matrices[k]['s_gg']
+        s_gg_f = s_gg.tocsr()[local_gamma_face_index, :].tocsc()[:, local_gamma_face_index].tocsr()
+        self.s_gg_solver_f[k] = splu(s_gg_f.tocsc())
+
+        local_gamma_edge_index = np.array([], dtype=int)
+
+        for i in coarse_interior_edge:
+            index_sub_i = np.array([], dtype=int)
+            edge_index_i = neighboring_fine_edge[coarse_edge_interior_vertex[i][0]]
+            for e in edge_index_i:
+                index_sub_i = np.append(index_sub_i, np.where(gamma_index == e))
+
+            local_gamma_edge_index = np.append(local_gamma_edge_index, index_sub_i)
+
+        self.smoother_index_edge_gamma_ov[k] = local_gamma_edge_index
+
+        s_gg_e = s_gg.tocsr()[local_gamma_edge_index, :].tocsc()[:, local_gamma_edge_index].tocsr()
+        self.s_gg_solver_e[k] = splu(s_gg_e.tocsc())
+
     def smoother(self, x, k):
         if self.smoothing_method == 'edge_gamma_is':
             return self.smoother_edge_gamma_is(x, k)
         elif self.smoothing_method == 'vertex_gamma_is':
             return self.smoother_vertex_gamma_is(x, k)
+        elif self.smoothing_method == 'face_edge_ov':
+            return self.smoother_face_edge_ov(x, k)
 
     def smoother_vertex_gamma_is(self, x, k):
         y = np.zeros_like(x)
@@ -208,11 +285,10 @@ class MG:
         face_index = self.smoother_index_sc[k]['face']
         edge_index = self.smoother_index_sc[k]['edge']
         gamma_index = np.append(face_index, edge_index)
-        a_ii = self.matrices[k]['a_ii']
         a_ig = self.matrices[k]['a_ig']
         a_gi = self.matrices[k]['a_gi']
 
-        xt = spsolve(a_ii, x[interior_index]).reshape(-1, 1)
+        xt = self.a_ii_solver[k].solve(x[interior_index])
         xg = x[gamma_index] - a_gi * xt
         yg = np.zeros_like(xg)
 
@@ -223,10 +299,8 @@ class MG:
         coarse_vertex_size = self.mesh[k - 1].get_vertex_size()
         coarse_boundary_vertex_size = len(self.mesh[k - 1].get_boundary_vertex())
         coarse_interior_vertex_size = coarse_vertex_size - coarse_boundary_vertex_size
+
         for i in np.arange(coarse_interior_vertex_size):
-            face_index_sub_g = self.smoother_index_vertex[k][i]['face']
-            edge_index_sub_g = self.smoother_index_vertex[k][i]['edge']
-            interior_index_sub_g = self.smoother_index_vertex[k][i]['interior']
             face_index_sub = np.array([], dtype=int)
             for j in self.smoother_index_vertex[k][i]['face_index_interior']:
                 face_index_sub = np.append(face_index_sub, np.arange(4 * j, 4 * (j + 1)))
@@ -234,12 +308,17 @@ class MG:
             edge_index_sub = np.array([], dtype=int)
             for j in self.smoother_index_vertex[k][i]['edge_index_interior']:
                 edge_index_sub = np.append(edge_index_sub, np.arange(offset + 2 * j, offset + 2 * (j + 1)))
-            gamma_index_sub_g = np.append(face_index_sub_g, edge_index_sub_g)
             gamma_index_sub = np.append(face_index_sub, edge_index_sub)
-            zg = self.apply_inverse_sc(xg[gamma_index_sub], k, interior_index_sub_g, gamma_index_sub_g)
+            size_interface = gamma_index_sub.shape[0]
+            size_index = self.smoother_index_vertex[k][i]['interior'].shape[0] + size_interface
+            zt = np.zeros((size_index, 1))
+            zt[-size_interface:] = xg[gamma_index_sub]
+            z = self.sc_solver[k][i].solve(zt)
+            zg = z[-size_interface:]
+
             yg[gamma_index_sub] = yg[gamma_index_sub] + zg
 
-        y[interior_index] = xt - spsolve(a_ii, a_ig * yg).reshape(-1, 1)
+        y[interior_index] = xt - self.a_ii_solver[k].solve(a_ig * yg)
         y[gamma_index] = y[gamma_index] + yg
 
         y = self.damping_factor * y
@@ -251,11 +330,10 @@ class MG:
         face_index = self.smoother_index_sc[k]['face']
         edge_index = self.smoother_index_sc[k]['edge']
         gamma_index = np.append(face_index, edge_index)
-        a_ii = self.matrices[k]['a_ii']
         a_ig = self.matrices[k]['a_ig']
         a_gi = self.matrices[k]['a_gi']
 
-        xt = self.apply_inverse_interior(x, k)[interior_index]
+        xt = self.a_ii_solver[k].solve(x[interior_index])
         xg = x[gamma_index] - a_gi * xt
         yg = np.zeros_like(xg)
 
@@ -266,26 +344,58 @@ class MG:
         coarse_interior_edge_size = len(self.interior[k - 1])
 
         for i in np.arange(coarse_interior_edge_size):
-            face_index_sub_g = self.smoother_index_edge[k][i]['face']
-            edge_index_sub_g = self.smoother_index_edge[k][i]['edge']
-            interior_index_sub_g = self.smoother_index_edge[k][i]['interior']
             face_index_sub = np.array([], dtype=int)
             for j in self.smoother_index_edge[k][i]['face_index_interior']:
                 face_index_sub = np.append(face_index_sub, np.arange(4 * j, 4 * (j + 1)))
             offset = 4 * coarse_interior_face_size
             edge_index_sub = np.array([], dtype=int)
             edge_index_sub = np.append(edge_index_sub, np.arange(offset + 2 * i, offset + 2 * (i + 1)))
-            gamma_index_sub_g = np.append(face_index_sub_g, edge_index_sub_g)
             gamma_index_sub = np.append(face_index_sub, edge_index_sub)
-            zg = self.apply_inverse_sc(xg[gamma_index_sub], k, interior_index_sub_g, gamma_index_sub_g)
+
+            size_interface = gamma_index_sub.shape[0]
+            size_index = self.smoother_index_edge[k][i]['interior'].shape[0] + size_interface
+            zt = np.zeros((size_index, 1))
+            zt[-size_interface:] = xg[gamma_index_sub]
+            z = self.sc_solver[k][i].solve(zt)
+            zg = z[-size_interface:]
+
             yg[gamma_index_sub] = yg[gamma_index_sub] + zg
 
         y[interior_index] = y[interior_index] + xt
-        y[interior_index] = y[interior_index] - spsolve(a_ii, a_ig * yg).reshape(-1, 1)
+        y[interior_index] = y[interior_index] - self.a_ii_solver[k].solve(a_ig * yg)
         y[gamma_index] = y[gamma_index] + yg
 
         y = self.damping_factor * y
 
+        return y
+
+    def smoother_face_edge_ov(self, x, k):
+        y = np.zeros_like(x)
+        interior_index = self.smoother_index_sc[k]['interior']
+        face_index = self.smoother_index_sc[k]['face']
+        edge_index = self.smoother_index_sc[k]['edge']
+        gamma_index = np.append(face_index, edge_index)
+
+        local_gamma_face_index = self.smoother_index_face_gamma_ov[k]
+        local_gamma_edge_index = self.smoother_index_edge_gamma_ov[k]
+
+        a_ig = self.matrices[k]['a_ig']
+        a_gi = self.matrices[k]['a_gi']
+
+        xt = self.a_ii_solver[k].solve(x[interior_index])
+        xg = x[gamma_index] - a_gi * xt
+        yg = np.zeros_like(xg)
+
+        zg = self.s_gg_solver_f[k].solve(xg[local_gamma_face_index])
+        yg[local_gamma_face_index] = yg[local_gamma_face_index] + zg
+
+        zg = self.s_gg_solver_e[k].solve(xg[local_gamma_edge_index])
+        yg[local_gamma_edge_index] = yg[local_gamma_edge_index] + zg
+
+        y[interior_index] = xt - self.a_ii_solver[k].solve(a_ig * yg)
+        y[gamma_index] = y[gamma_index] + yg
+
+        y = self.damping_factor * y
         return y
 
     def apply_inverse_interior(self, x, k):
